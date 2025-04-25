@@ -1,0 +1,56 @@
+{
+  "name": "mcp-excel-controller-pro",
+  "version": "1.2.8",
+  "description": "Excel Controller MCP Server",
+  "bin": {
+    "mcp-excel-controller": "./server.js"
+  },
+  "main": "server.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">= 14.0.0",
+    "npm": ">= 6.0.0"
+  },
+  "homepage": "https://github.com/Jerry-is-coder/mcp-excel-controller-pro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jerry-is-coder/mcp-excel-controller-pro"
+  },
+  "url": "https://github.com/Jerry-is-coder/mcp-excel-controller-pro/issues",
+  "keywords": [
+    "excel",
+    "mcp",
+    "api",
+    "excel automation",
+    "nodejs cli",
+    "excel controller",
+    "spreadsheet",
+    "data processing",
+    "exceljs",
+    "xlsx"
+  ],
+  "author": {
+    "name": "JerryIsCoder",
+    "email": "jerry.is.coder@gmail.com",
+    "url": "https://www.youtube.com/@%EC%BD%94%EB%93%9C%EA%B9%8E%EB%8A%94%EB%85%B8%EC%9D%B8"
+  },
+  "contributors": [],
+  "scripts": {
+    "dev": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0",
+    "axios": "^1.6.2",
+    "exceljs": "^4.4.0",
+    "form-data": "^4.0.0",
+    "node-powershell": "^5.0.1",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.2"
+  }
+}
