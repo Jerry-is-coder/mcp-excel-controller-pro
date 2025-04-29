@@ -1,6 +1,6 @@
 {
   "name": "mcp-excel-controller-pro",
-  "version": "1.2.8",
+  "version": "1.4.7",
   "description": "Excel Controller MCP Server",
   "bin": {
     "mcp-excel-controller": "./server.js"
@@ -25,6 +25,8 @@
   "keywords": [
     "excel",
     "mcp",
+    "excel-mcp",
+    "mcp-excel",
     "api",
     "excel automation",
     "nodejs cli",

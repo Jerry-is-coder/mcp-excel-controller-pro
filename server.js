@@ -50,22 +50,104 @@ async function openExcelFile(filePath) {
   }
 }
 
-// COM 인터페이스로 열린 Excel 파일의 직접적인 범위 수정 함수
-async function updateOpenExcelByRange(filePath, sheetName, data) {
+// 파일이 열려있는지 확인하는 함수
+function isFileOpen(filePath) {
   try {
-    // 정규화된 경로로 변환
-    const normalizedPath = path.resolve(filePath);
+    const fd = fs.openSync(filePath, "r+");
+    fs.closeSync(fd);
+    return false;
+  } catch (e) {
+    return true;
+  }
+}
 
-    // 데이터 형식 검증
-    if (!Array.isArray(data) || data.length === 0) {
-      return {
-        success: false,
-        message: "유효한 데이터가 아닙니다. 2차원 배열 형식이어야 합니다.",
-      };
+// 임시 PowerShell 스크립트 실행 함수
+async function runPowerShellScript(scriptContent) {
+  const timestamp = Date.now();
+  const scriptPath = path.join(process.cwd(), `excel_script_${timestamp}.ps1`);
+
+  try {
+    // 스크립트를 파일로 저장
+    fs.writeFileSync(scriptPath, scriptContent);
+
+    // PowerShell 스크립트 실행
+    const result = await execPromise(
+      `powershell -ExecutionPolicy Bypass -NoLogo -NonInteractive -File "${scriptPath}" 2> NUL`
+    );
+
+    return result;
+  } catch (error) {
+    throw error;
+  } finally {
+    // 임시 파일 삭제
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch (err) {
+      // 파일 삭제 오류는 무시
     }
+  }
+}
 
-    // PowerShell 스크립트 작성 - 디버그 출력 완전 제거
-    let psScript = `
+// Excel 셀 참조(예: "A1", "B5")를 행과 열 번호로 변환하는 함수
+function cellReferenceToRowCol(cellReference) {
+  // 알파벳과 숫자 부분 분리 (예: "A11" -> "A"와 "11")
+  const match = cellReference.match(/([A-Za-z]+)([0-9]+)/);
+  if (!match) {
+    throw new Error(`유효하지 않은 셀 참조: ${cellReference}`);
+  }
+
+  const colStr = match[1].toUpperCase();
+  const row = parseInt(match[2], 10);
+
+  // 알파벳을 열 번호로 변환 (A=1, B=2, ..., Z=26, AA=27, ...)
+  let col = 0;
+  for (let i = 0; i < colStr.length; i++) {
+    col = col * 26 + (colStr.charCodeAt(i) - 64);
+  }
+
+  return { row, col };
+}
+
+// Excel 프로세스 확인 및 대기 함수
+async function waitForExcelAvailable(maxAttempts = 3) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const result = await execPromise(
+        'powershell -Command "Get-Process excel -ErrorAction SilentlyContinue | Out-String"'
+      );
+      if (result && result.trim()) {
+        // Excel이 실행 중이면 잠시 대기
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return true;
+      }
+    } catch (e) {
+      // 오류 무시
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+// 열려있는 Excel 파일의 데이터 업데이트 함수 (재시도 로직 포함)
+async function updateExcelWithRetry(filePath, sheetName, data, maxAttempts = 3) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      // Excel 프로세스 확인 및 대기
+      await waitForExcelAvailable();
+      
+      // 정규화된 경로로 변환
+      const normalizedPath = path.resolve(filePath);
+
+      // 데이터 형식 검증
+      if (!Array.isArray(data) || data.length === 0) {
+        return {
+          success: false,
+          message: "유효한 데이터가 아닙니다. 2차원 배열 형식이어야 합니다.",
+        };
+      }
+
+      // PowerShell 스크립트 작성 - 디버그 출력 완전 제거
+      let psScript = `
         # 모든 오류 메시지 숨기기 (중요한 오류만 캡처)
         $ErrorActionPreference = "SilentlyContinue"
         
@@ -109,8 +191,8 @@ async function updateOpenExcelByRange(filePath, sheetName, data) {
             $worksheet = $null
         `;
 
-    if (sheetName) {
-      psScript += `
+      if (sheetName) {
+        psScript += `
             # 지정된 시트 찾기 시도
             try {
                 $worksheet = $workbook.Worksheets("${sheetName}")
@@ -119,14 +201,14 @@ async function updateOpenExcelByRange(filePath, sheetName, data) {
                 $worksheet = $workbook.Worksheets.Item(1)
             }
             `;
-    } else {
-      psScript += `
+      } else {
+        psScript += `
             # 시트 이름을 지정하지 않았으므로 활성 시트 사용
             $worksheet = $workbook.ActiveSheet
             `;
-    }
+      }
 
-    psScript += `
+      psScript += `
             # 시트 활성화 - 현재 활성 시트로 설정
             $worksheet.Activate()
             
@@ -134,9 +216,7 @@ async function updateOpenExcelByRange(filePath, sheetName, data) {
             # 주의: 기존 데이터가 없을 수도 있으므로 예외 처리
             try {
                 $usedRange = $worksheet.UsedRange
-                if ($usedRange -ne $null -and $usedRange.Cells.Count -gt 0) {
-                    $usedRange.Clear()
-                }
+                if ($usedRange -ne $null -and $usedRange.Cells.Count -gt 0)
             } catch {
                 # 계속 진행
             }
@@ -152,43 +232,43 @@ async function updateOpenExcelByRange(filePath, sheetName, data) {
             $dataArray = New-Object 'object[,]' $rowCount, $colCount
         `;
 
-    // 데이터 행과 열에 대한 설정
-    for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
-      const row = data[rowIndex];
-      for (let colIndex = 0; colIndex < row.length; colIndex++) {
-        const cellValue = row[colIndex];
-        // 값 타입에 따른 처리
-        if (typeof cellValue === "string") {
-          // 문자열은 따옴표로 묶고 특수문자 처리
-          const escapedValue = cellValue
-            .replace(/'/g, "''")
-            .replace(/"/g, '""');
-          psScript += `
+      // 데이터 행과 열에 대한 설정
+      for (let rowIndex = 0; rowIndex < data.length; rowIndex++) {
+        const row = data[rowIndex];
+        for (let colIndex = 0; colIndex < row.length; colIndex++) {
+          const cellValue = row[colIndex];
+          // 값 타입에 따른 처리
+          if (typeof cellValue === "string") {
+            // 문자열은 따옴표로 묶고 특수문자 처리
+            const escapedValue = cellValue
+              .replace(/'/g, "''")
+              .replace(/"/g, '""');
+            psScript += `
             $dataArray[${rowIndex}, ${colIndex}] = '${escapedValue}'`;
-        } else if (cellValue === null || cellValue === undefined) {
-          // null/undefined는 빈 문자열로
-          psScript += `
+          } else if (cellValue === null || cellValue === undefined) {
+            // null/undefined는 빈 문자열로
+            psScript += `
             $dataArray[${rowIndex}, ${colIndex}] = ''`;
-        } else if (typeof cellValue === "number") {
-          // 숫자는 그대로
-          psScript += `
+          } else if (typeof cellValue === "number") {
+            // 숫자는 그대로
+            psScript += `
             $dataArray[${rowIndex}, ${colIndex}] = ${cellValue}`;
-        } else if (typeof cellValue === "boolean") {
-          // 불리언 값 처리
-          psScript += `
+          } else if (typeof cellValue === "boolean") {
+            // 불리언 값 처리
+            psScript += `
             $dataArray[${rowIndex}, ${colIndex}] = $${cellValue}`;
-        } else {
-          // 기타 값은 문자열로 변환
-          psScript += `
+          } else {
+            // 기타 값은 문자열로 변환
+            psScript += `
             $dataArray[${rowIndex}, ${colIndex}] = '${String(cellValue).replace(
-            /'/g,
-            "''"
-          )}'`;
+              /'/g,
+              "''"
+            )}'`;
+          }
         }
       }
-    }
 
-    psScript += `
+      psScript += `
             
             # 데이터 배열을 범위에 한 번에 설정
             $targetRange.Value2 = $dataArray
@@ -224,82 +304,294 @@ async function updateOpenExcelByRange(filePath, sheetName, data) {
         }
         `;
 
-    // 임시 PS1 파일 경로
-    const timestamp = Date.now();
-    const scriptPath = path.join(
-      process.cwd(),
-      `excel_range_update_${timestamp}.ps1`
-    );
+      // PowerShell 스크립트 실행
+      const result = await runPowerShellScript(psScript);
 
-    // 스크립트를 파일로 저장
-    fs.writeFileSync(scriptPath, psScript);
-
-    // PowerShell 스크립트 실행 - 표준 오류는 완전히 버림
-    const result = await execPromise(
-      `powershell -ExecutionPolicy Bypass -NoLogo -NonInteractive -File "${scriptPath}" 2> NUL`
-    );
-
-    // 임시 파일 삭제
-    try {
-      fs.unlinkSync(scriptPath);
-    } catch (err) {
-      // 파일 삭제 오류는 무시
+      // 결과 확인
+      if (result && result.includes("SUCCESS")) {
+        return { success: true, message: result.trim() };
+      } else {
+        if (i === maxAttempts - 1) {
+          // 마지막 시도에서 실패했을 때만 오류 반환
+          return {
+            success: false,
+            message: result
+              ? result.trim()
+              : "스크립트 실행 중 오류가 발생했습니다.",
+          };
+        }
+        // 아니면 재시도를 위해 계속 진행
+      }
+    } catch (error) {
+      console.error(`시도 ${i + 1}/${maxAttempts} 실패:`, error.message);
+      if (i === maxAttempts - 1) {
+        // 마지막 시도에서 실패했을 때만 오류 반환
+        return {
+          success: false,
+          message: `범위 데이터 업데이트 오류: ${error.message}`,
+        };
+      }
     }
-
-    // 결과 확인
-    if (result && result.includes("SUCCESS")) {
-      return { success: true, message: result.trim() };
-    } else {
-      return {
-        success: false,
-        message: result
-          ? result.trim()
-          : "스크립트 실행 중 오류가 발생했습니다.",
-      };
-    }
-  } catch (error) {
-    console.error("직접 범위 업데이트 오류:", error);
-    return {
-      success: false,
-      message: `범위 데이터 업데이트 오류: ${error.message}`,
-    };
+    // 다음 시도 전 잠시 대기 (점진적으로 대기 시간 증가)
+    await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
   }
+  
+  // 모든 시도 실패 시 기본 오류 반환
+  return {
+    success: false,
+    message: `${maxAttempts}번 시도 후에도 Excel 파일 업데이트 실패`,
+  };
 }
 
-// 대량 데이터 업데이트 도구
+// 특정 셀들만 업데이트하는 함수
+async function updateSpecificCells(filePath, sheetName, cellData, maxAttempts = 3) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      // Excel 프로세스 확인 및 대기
+      await waitForExcelAvailable();
+      
+      // 정규화된 경로로 변환
+      const normalizedPath = path.resolve(filePath);
+
+      // PowerShell 스크립트 작성
+      let psScript = `
+        # 모든 오류 메시지 숨기기 (중요한 오류만 캡처)
+        $ErrorActionPreference = "SilentlyContinue"
+        
+        try {
+            # 기존 Excel 인스턴스 가져오기
+            $excel = $null
+            try {
+                $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+            } catch {
+                # 기존 인스턴스가 없으면 새로 생성
+                $excel = New-Object -ComObject Excel.Application
+            }
+            
+            $excel.Visible = $true
+            $excel.DisplayAlerts = $false
+            
+            # 이미 열려있는 워크북 찾기
+            $workbook = $null
+            foreach ($wb in $excel.Workbooks) {
+                if ($wb.FullName -eq "${normalizedPath.replace(
+                  /\\/g,
+                  "\\\\"
+                )}") {
+                    $workbook = $wb
+                    break
+                }
+            }
+            
+            # 워크북이 없으면 열기
+            if ($workbook -eq $null) {
+                $workbook = $excel.Workbooks.Open("${normalizedPath.replace(
+                  /\\/g,
+                  "\\\\"
+                )}")
+            }
+            
+            # 워크북 활성화 - 현재 활성 워크북으로 설정
+            $workbook.Activate()
+            
+            # 시트 선택
+            $worksheet = $null
+        `;
+
+      if (sheetName) {
+        psScript += `
+            # 지정된 시트 찾기 시도
+            try {
+                $worksheet = $workbook.Worksheets("${sheetName}")
+            } catch {
+                # 지정된 시트가 없으면 첫 번째 시트 사용
+                $worksheet = $workbook.Worksheets.Item(1)
+            }
+            `;
+      } else {
+        psScript += `
+            # 시트 이름을 지정하지 않았으므로 활성 시트 사용
+            $worksheet = $workbook.ActiveSheet
+            `;
+      }
+
+      psScript += `
+            # 시트 활성화 - 현재 활성 시트로 설정
+            $worksheet.Activate()
+            
+            # 각 셀 업데이트
+            $updateCount = 0
+            $errorCount = 0
+        `;
+
+      // 각 셀 업데이트 코드 추가
+      for (const cell of cellData) {
+        try {
+          let cellReference = cell.cellReference;
+          let value = cell.value;
+          
+          // 셀 참조를 행과 열 번호로 변환 시도
+          let row, col;
+          
+          try {
+            const result = cellReferenceToRowCol(cellReference);
+            row = result.row;
+            col = result.col;
+          } catch (err) {
+            // 셀 참조 변환 오류 처리
+            psScript += `
+            Write-Output "ERROR_CELL: 유효하지 않은 셀 참조 - ${cellReference}"
+            $errorCount++
+            `;
+            continue;
+          }
+          
+          // 값 타입에 따른 처리
+          let valueStr;
+          if (typeof value === "string") {
+            valueStr = `"${value.replace(/"/g, '""')}"`;
+          } else if (value === null || value === undefined) {
+            valueStr = '""';
+          } else if (typeof value === "boolean") {
+            valueStr = value ? "$true" : "$false";
+          } else {
+            valueStr = value;
+          }
+
+          // 셀 업데이트 코드 추가
+          psScript += `
+          try {
+            $worksheet.Cells(${row}, ${col}).Value2 = ${valueStr}
+            $updateCount++
+          } catch {
+            $errorCount++
+            Write-Output "ERROR_CELL: 셀 ${cellReference} 업데이트 중 오류 발생"
+          }
+          `;
+        } catch (error) {
+          // 코드 생성 중 오류는 무시하고 계속 진행
+          continue;
+        }
+      }
+
+      psScript += `
+            # 저장 확인
+            $workbook.Save()
+            
+            # 성공 메시지 - 표준 출력으로만 한 줄 출력
+            Write-Output "SUCCESS: 총 $updateCount 개 셀이 업데이트됨 (오류: $errorCount 개)"
+        } catch {
+            # 오류 내용 - 표준 출력으로만 한 줄 출력
+            Write-Output "ERROR: $($_.Exception.Message)"
+        } finally {
+            # COM 객체 참조 해제 (Excel 프로그램은 종료하지 않음)
+            if ($worksheet -ne $null) {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($worksheet) | Out-Null
+            }
+            if ($workbook -ne $null) {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($workbook) | Out-Null
+            }
+            if ($excel -ne $null) {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
+            }
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+        }
+        `;
+
+      // PowerShell 스크립트 실행
+      const result = await runPowerShellScript(psScript);
+
+      // 결과 확인
+      if (result && result.includes("SUCCESS")) {
+        return { success: true, message: result.trim() };
+      } else {
+        if (i === maxAttempts - 1) {
+          // 마지막 시도에서 실패했을 때만 오류 반환
+          return {
+            success: false,
+            message: result
+              ? result.trim()
+              : "스크립트 실행 중 오류가 발생했습니다.",
+          };
+        }
+        // 아니면 재시도를 위해 계속 진행
+      }
+    } catch (error) {
+      console.error(`시도 ${i + 1}/${maxAttempts} 실패:`, error.message);
+      if (i === maxAttempts - 1) {
+        // 마지막 시도에서 실패했을 때만 오류 반환
+        return {
+          success: false,
+          message: `셀 데이터 업데이트 오류: ${error.message}`,
+        };
+      }
+    }
+    // 다음 시도 전 잠시 대기 (점진적으로 대기 시간 증가)
+    await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1)));
+  }
+  
+  // 모든 시도 실패 시 기본 오류 반환
+  return {
+    success: false,
+    message: `${maxAttempts}번 시도 후에도 Excel 셀 업데이트 실패`,
+  };
+}
+
+// 통합된 Excel 업데이트 도구
+// 통합된 Excel 업데이트 도구
 server.tool(
-  "bulk_update_excel",
-  "열려있거나 닫혀있는 Excel 파일에 대량의 데이터를 한 번에 업데이트합니다.",
+  "update_excel",
+  "Excel 파일의 데이터를 업데이트합니다. 전체 범위 또는 특정 셀을 지정하여 업데이트할 수 있습니다.",
   {
     filePath: z.string().describe("엑셀 파일의 경로"),
     sheetName: z
       .string()
       .optional()
-      .describe("시트 이름 (기본값: 첫 번째 시트)"),
-    data: z.array(z.array(z.any())).describe("2차원 배열 형태의 데이터"),
+      .describe("시트 이름 (지정하지 않으면 활성 시트 또는 첫 번째 시트)"),
+    // 세 가지 업데이트 모드 중 하나 선택
+    mode: z
+      .enum(["full", "append", "cells"])
+      .default("full")
+      .describe("업데이트 모드 (full: 덮어쓰기, append: 추가, cells: 특정 셀)"),
+    data: z
+      .array(z.array(z.any()))
+      .optional()
+      .describe("2차원 배열 형태의 데이터 (full 또는 append 모드에서 사용)"),
+    cellData: z
+      .array(
+        z.object({
+          cellReference: z.string(),
+          value: z.any(),
+        })
+      )
+      .optional()
+      .describe("업데이트할 셀 데이터 배열 (cells 모드에서 사용)"),
     openFile: z
       .boolean()
       .optional()
       .default(false)
       .describe("작업 후 Excel로 파일을 열지 여부"),
-    append: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe("데이터 추가 모드 (true: 추가, false: 덮어쓰기)"),
     createBackup: z
       .boolean()
       .optional()
       .default(true)
       .describe("작업 전 백업 생성 여부"),
+    smartMerge: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("스마트 데이터 병합 모드 (데이터 구조 분석 및 적절한 병합, append 모드에서만 사용)"),
   },
   async ({
     filePath,
     sheetName,
+    mode = "full",
     data,
-    openFile,
-    append = true,
+    cellData,
+    openFile = false,
     createBackup = true,
+    smartMerge = true,
   }) => {
     try {
       // 파일 존재 확인
@@ -312,8 +604,8 @@ server.tool(
         };
       }
 
-      // 데이터 유효성 검사
-      if (!Array.isArray(data) || data.length === 0) {
+      // 모드에 따른 데이터 유효성 검사
+      if ((mode === "full" || mode === "append") && (!Array.isArray(data) || data.length === 0)) {
         // 데이터가 없지만 파일을 열기만 원하는 경우
         if (openFile) {
           const success = await openExcelFile(filePath);
@@ -347,6 +639,40 @@ server.tool(
         };
       }
 
+      if (mode === "cells" && (!Array.isArray(cellData) || cellData.length === 0)) {
+        // 데이터가 없지만 파일을 열기만 원하는 경우
+        if (openFile) {
+          const success = await openExcelFile(filePath);
+          if (success) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `엑셀 파일이 성공적으로 열렸습니다: ${filePath}`,
+                },
+              ],
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `엑셀 파일을 열지 못했습니다: ${filePath}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
+
+        return {
+          content: [
+            { type: "text", text: "유효한 셀 데이터가 제공되지 않았습니다." },
+          ],
+          isError: true,
+        };
+      }
+
       // 백업 디렉토리 및 파일 생성 (작업 전)
       let backupPath = "";
       if (createBackup) {
@@ -367,7 +693,7 @@ server.tool(
           fs.mkdirSync(backupDir, { recursive: true });
         }
 
-        // Intl.DateTimeFormat을 사용하여 사용자의 현지 시간대로 형식화
+        // 현지 시간대로 형식화
         const now = new Date();
         const options = {
           year: "numeric",
@@ -380,176 +706,307 @@ server.tool(
         };
 
         // 시스템의 현지 시간대를 사용
-        const localTime = new Intl.DateTimeFormat(undefined, options).format(
-          now
-        );
+        const localTime = new Intl.DateTimeFormat(undefined, options).format(now);
 
         // 형식 정리 (yyyy-MM-dd HH:mm:ss → yyyyMMdd_HHmmss)
         const timestamp = localTime
           .replace(/[\/\-\,\s]/g, "") // 슬래시, 하이픈, 콤마, 공백 제거
           .replace(/:/g, "") // 콜론 제거
           .replace(/(\d{8})(\d{6})/, "$1_$2"); // 날짜와 시간 사이에 언더스코어 추가
-          backupPath = path.join(backupDir, `${fileNameWithoutExt}_${timestamp}${fileExt}`);
+        backupPath = path.join(backupDir, `${fileNameWithoutExt}_${timestamp}${fileExt}`);
+
         // 파일 복사
         fs.copyFileSync(filePath, backupPath);
       }
 
-      // 데이터 병합 준비 - 기존 데이터 읽기 (append 모드인 경우)
-      let existingData = [];
-      if (append) {
-        try {
-          // ExcelJS를 사용하여 파일 읽기 시도
-          const tempWorkbook = new ExcelJS.Workbook();
-          await tempWorkbook.xlsx.readFile(filePath);
+      // 파일이 열려있는지 확인
+      const fileIsOpen = isFileOpen(filePath);
+      
+      // 모드에 따른 처리 - cells 모드 또는 full/append 모드
+      let processCellData = [];
+      
+      if (mode === "cells") {
+        // cells 모드: 사용자 제공 셀 데이터 그대로 사용
+        processCellData = cellData;
+      } else {
+        // full 또는 append 모드: 2D 배열을 셀 데이터로 변환
+        
+        // append 모드면 기존 데이터 가져와서 병합
+        let mergedData = [];
+        
+        if (mode === "append") {
+          // 기존 데이터 가져오기
+          let existingData = [];
+          try {
+            // ExcelJS를 사용하여 파일 읽기 시도
+            const tempWorkbook = new ExcelJS.Workbook();
+            await tempWorkbook.xlsx.readFile(filePath);
 
-          // 시트 선택
-          let tempWorksheet;
-          if (sheetName) {
-            tempWorksheet = tempWorkbook.getWorksheet(sheetName);
-          } else if (tempWorkbook.worksheets.length > 0) {
-            tempWorksheet = tempWorkbook.worksheets[0];
-          }
+            // 시트 선택
+            let tempWorksheet;
+            if (sheetName) {
+              tempWorksheet = tempWorkbook.getWorksheet(sheetName);
+            } else if (tempWorkbook.worksheets.length > 0) {
+              tempWorksheet = tempWorkbook.worksheets[0];
+            }
 
-          // 시트에서 데이터 추출
-          if (tempWorksheet) {
-            existingData = [];
-            tempWorksheet.eachRow((row, rowNumber) => {
-              const rowData = [];
-              row.eachCell((cell, colNumber) => {
-                rowData[colNumber - 1] = cell.value;
+            // 시트에서 데이터 추출
+            if (tempWorksheet) {
+              existingData = [];
+              tempWorksheet.eachRow((row, rowNumber) => {
+                const rowData = [];
+                row.eachCell((cell, colNumber) => {
+                  rowData[colNumber - 1] = cell.value;
+                });
+                existingData[rowNumber - 1] = rowData;
               });
-              existingData[rowNumber - 1] = rowData;
-            });
 
-            // 빈 행 제거 (맨 앞에 있을 수 있는 undefined 요소)
-            existingData = existingData.filter((row) => row !== undefined);
+              // 빈 행 제거 (맨 앞에 있을 수 있는 undefined 요소)
+              existingData = existingData.filter((row) => row !== undefined);
+            }
+          } catch (err) {
+            // 읽기 실패 시 빈 배열로 진행
+            existingData = [];
           }
-        } catch (err) {
-          // 읽기 실패 시 빈 배열로 진행
-          existingData = [];
+
+          // 데이터 병합
+          if (existingData.length > 0) {
+            if (smartMerge) {
+              // 기존 데이터 분석
+              const existingHeadersCount = existingData[0]?.length || 0;
+              const newHeadersCount = data[0]?.length || 0;
+              
+              // 데이터 병합 방식 결정
+              if (newHeadersCount > existingHeadersCount) {
+                // 새 데이터에 열이 더 많은 경우: 열 확장 처리
+                mergedData = existingData.map((row, rowIndex) => {
+                  if (rowIndex < data.length) {
+                    // 기존 데이터의 키 열을 기준으로 일치하는 행 찾기
+                    // 여기서는 첫 번째 열을 키로 가정 (예: 영어단어)
+                    if (row[0] === data[rowIndex][0]) {
+                      // 첫 번째 열 값이 일치하면 나머지 열 확장
+                      return [...row, ...data[rowIndex].slice(existingHeadersCount)];
+                    }
+                  }
+                  return row;
+                });
+                
+                // 기존 데이터에 없는 새 행 추가
+                const existingKeys = existingData.map(row => row[0]);
+                const newRows = data.filter(row => !existingKeys.includes(row[0]));
+                mergedData = [...mergedData, ...newRows];
+              } 
+              else if (data.length > existingData.length) {
+                // 새 데이터에 행이 더 많은 경우: 행 추가 처리
+                const existingKeys = existingData.map(row => row[0]);
+                
+                // 기존 데이터와 중복되지 않는 새 행만 추가
+                const newRows = data.filter(row => !existingKeys.includes(row[0]));
+                mergedData = [...existingData, ...newRows];
+              }
+              else {
+                // 동일한 구조이거나 단순 업데이트: 키 비교 후 병합
+                const mergeMap = new Map();
+                
+                // 기존 데이터를 Map에 저장 (키: 첫 열 값)
+                existingData.forEach(row => {
+                  mergeMap.set(row[0], row);
+                });
+                
+                // 새 데이터로 업데이트 또는 추가
+                data.forEach(row => {
+                  mergeMap.set(row[0], row);
+                });
+                
+                // Map을 다시 배열로 변환
+                mergedData = Array.from(mergeMap.values());
+              }
+            } else {
+              // 스마트 병합 비활성화: 단순 추가
+              mergedData = [...existingData, ...data];
+            }
+          } else {
+            // 기존 데이터가 없으면 새 데이터 그대로 사용
+            mergedData = data;
+          }
+        } else {
+          // full 모드: 데이터 그대로 사용
+          mergedData = data;
+          
+          // 현재 시트의 사용된 범위 정보 가져오기
+          let maxRow = 0;
+          let maxCol = 0;
+          
+          // 파일이 열려있지 않은 경우 기존 시트 범위 정보 가져오기
+          if (!fileIsOpen) {
+            try {
+              const tempWorkbook = new ExcelJS.Workbook();
+              await tempWorkbook.xlsx.readFile(filePath);
+              const tempWorksheet = sheetName 
+                ? tempWorkbook.getWorksheet(sheetName) 
+                : tempWorkbook.worksheets[0];
+              
+              if (tempWorksheet && tempWorksheet.usedRange) {
+                maxRow = tempWorksheet.rowCount || 100; // 기본값 제공
+                maxCol = tempWorksheet.columnCount || 20; // 기본값 제공
+              } else {
+                // 기본 범위 제공
+                maxRow = 100;
+                maxCol = 20;
+              }
+            } catch (err) {
+              // 읽기 실패 시 기본 범위 사용
+              maxRow = 100;
+              maxCol = 20;
+            }
+          } else {
+            // 파일이 열려있는 경우 더 넓은 기본 범위 사용
+            maxRow = 100;
+            maxCol = 20;
+          }
+          
+          // 명시적으로 기존 셀 데이터를 빈 값으로 설정하는 코드
+          const cellDataToEmpty = [];
+          // 기존 데이터의 모든 셀에 대해 빈 값 할당
+          for (let row = 1; row <= maxRow; row++) {
+            for (let col = 1; col <= maxCol; col++) {
+              let colLetter = '';
+              let tempCol = col;
+              while (tempCol > 0) {
+                const remainder = (tempCol - 1) % 26;
+                colLetter = String.fromCharCode(65 + remainder) + colLetter;
+                tempCol = Math.floor((tempCol - 1) / 26);
+              }
+              cellDataToEmpty.push({
+                cellReference: `${colLetter}${row}`,
+                value: ""
+              });
+            }
+          }
+          
+          // 빈 값으로 셀 초기화 먼저 수행
+          if (data.length === 0 || (data.length === 1 && data[0].length === 0)) {
+            // 빈 데이터인 경우 시트 초기화만 수행
+            processCellData = cellDataToEmpty;
+          } else {
+            // 빈 셀로 초기화 후 새 데이터 설정
+            processCellData = [...cellDataToEmpty];
+          }
+        }
+        
+        // 2D 배열 데이터를 cellData 형식으로 변환 (빈 데이터가 아닌 경우만)
+        if (!(mode === "full" && (data.length === 0 || (data.length === 1 && data[0].length === 0)))) {
+          for (let rowIndex = 0; rowIndex < mergedData.length; rowIndex++) {
+            const row = mergedData[rowIndex];
+            for (let colIndex = 0; colIndex < row.length; colIndex++) {
+              if (row[colIndex] === undefined || row[colIndex] === null) continue;
+              
+              // 열 문자 생성 (0 -> A, 1 -> B, ...)
+              let colLetter = '';
+              let tempCol = colIndex + 1;
+              
+              while (tempCol > 0) {
+                const remainder = (tempCol - 1) % 26;
+                colLetter = String.fromCharCode(65 + remainder) + colLetter;
+                tempCol = Math.floor((tempCol - 1) / 26);
+              }
+              
+              // A1 형식의 셀 참조 생성
+              const cellRef = `${colLetter}${rowIndex + 1}`;
+              
+              // full 모드에서 기존에 빈 셀 초기화를 했다면 해당 셀 참조는 덮어씌우기
+              if (mode === "full") {
+                // 이미 초기화된 셀 참조 찾기
+                const existingIndex = processCellData.findIndex(
+                  cell => cell.cellReference === cellRef
+                );
+                
+                if (existingIndex !== -1) {
+                  // 기존 셀 참조 업데이트
+                  processCellData[existingIndex].value = row[colIndex];
+                } else {
+                  // 없으면 새로 추가
+                  processCellData.push({
+                    cellReference: cellRef,
+                    value: row[colIndex]
+                  });
+                }
+              } else {
+                // append 모드에서는 그냥 추가
+                processCellData.push({
+                  cellReference: cellRef,
+                  value: row[colIndex]
+                });
+              }
+            }
+          }
         }
       }
-
-      // 데이터 병합 (append 모드인 경우)
-      let mergedData = [];
-      if (append && existingData.length > 0) {
-        mergedData = [...existingData, ...data];
-      } else {
-        mergedData = data;
-      }
-
-      // 파일이 열려있는지 확인
-      let isFileOpen = false;
-      try {
-        const fd = fs.openSync(filePath, "r+");
-        fs.closeSync(fd);
-      } catch (e) {
-        isFileOpen = true;
-      }
-
-      // 파일이 열려있고 대량 업데이트가 필요한 경우
-      if (isFileOpen) {
-        // 업데이트 시도와 결과를 저장할 변수
-        try {
-          // 여러 번 시도하는 래퍼 함수 사용
-          const result = await retryUpdateExcel(
-            filePath,
-            sheetName,
-            mergedData,
-            3
-          ); // 최대 3번 시도
-
-          if (result && result.success) {
-            // 추가적으로 파일 열기 명령 실행 (openFile이 true인 경우)
-            if (openFile) {
-              // COM 인터페이스를 통해 열린 파일을 전면에 가져오는 스크립트
-              const bringToFrontScript = `
-              $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
-              $excel.Visible = $true
-              $excel.Application.WindowState = -4143 # xlMaximized
-              $excel.Application.Activate()
-              `;
-
-              const timestamp = Date.now();
-              const scriptPath = path.join(
-                process.cwd(),
-                `bring_to_front_${timestamp}.ps1`
-              );
-
-              // 스크립트를 파일로 저장
-              fs.writeFileSync(scriptPath, bringToFrontScript);
-
-              // PowerShell 스크립트 실행 (오류는 무시)
-              try {
-                await execPromise(
-                  `powershell -ExecutionPolicy Bypass -NoLogo -NonInteractive -File "${scriptPath}"`
-                );
-              } catch (e) {
-                // 무시
-              }
-
-              // 임시 파일 삭제
-              try {
-                fs.unlinkSync(scriptPath);
-              } catch (err) {
-                // 파일 삭제 오류는 무시
-              }
-            }
-
-            let backupMessage = "";
-            if (createBackup && backupPath) {
-              backupMessage = `\n백업 생성됨: ${backupPath}`;
-            }
-
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `엑셀 파일에 데이터가 성공적으로 업데이트되었습니다:
-- 파일: ${filePath}
-- 시트: ${sheetName || "활성 시트"}
-- 모드: ${append ? "추가" : "덮어쓰기"}
-- 행 수: ${mergedData.length}${backupMessage}
-
-변경 사항이 Excel에 즉시 반영되었습니다.`,
-                },
-              ],
-            };
-          } else {
-            // 실패했지만 파일 열기만 시도
-            if (openFile) {
-              await openExcelFile(filePath);
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: `데이터 업데이트는 실패했지만 Excel 파일을 열기 시도했습니다: ${filePath}`,
-                  },
-                ],
-              };
-            }
-
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `열려있는 엑셀 파일 업데이트 실패: ${
-                    result ? result.message : "알 수 없는 오류"
-                  }`,
-                },
-              ],
-              isError: true,
-            };
+      
+      // 이제 모든 모드에서 셀 단위 업데이트 방식 사용
+      
+      if (fileIsOpen) {
+        // 파일이 열려있는 경우 COM 인터페이스 사용
+        const result = await updateSpecificCells(filePath, sheetName, processCellData, 3);
+        
+        if (result && result.success) {
+          // 요청 시 Excel로 파일 열기
+          if (openFile) {
+            // COM 인터페이스를 통해 열린 파일을 전면에 가져옴
+            const bringToFrontScript = `
+            $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+            $excel.Visible = $true
+            $excel.Application.WindowState = -4143 # xlMaximized
+            $excel.Application.Activate()
+            `;
+            await runPowerShellScript(bringToFrontScript);
           }
-        } catch (error) {
-          // 오류가 발생했지만 파일 열기만 시도
+
+          let backupMessage = "";
+          if (createBackup && backupPath) {
+            backupMessage = `\n백업 생성됨: ${backupPath}`;
+          }
+
+          // 성공 개수 추출
+          const successMatch = result.message.match(/총 (\d+) 개 셀이/);
+          const successCount = successMatch ? successMatch[1] : processCellData.length;
+          
+          // 오류 개수 추출
+          const errorMatch = result.message.match(/오류: (\d+) 개/);
+          const errorCount = errorMatch ? parseInt(errorMatch[1]) : 0;
+
+          // 모드에 따라 다른 성공 메시지 구성
+          let successText = "";
+          if (mode === "cells") {
+            successText = `엑셀 파일의 특정 셀들이 성공적으로 업데이트되었습니다:
+ - 파일: ${filePath}
+ - 시트: ${sheetName || "활성 시트"}
+ - 업데이트된 셀: ${successCount}개${errorCount > 0 ? ` (오류: ${errorCount}개)` : ''}${backupMessage}`;
+          } else {
+            successText = `엑셀 파일에 데이터가 성공적으로 업데이트되었습니다:
+ - 파일: ${filePath}
+ - 시트: ${sheetName || "활성 시트"}
+ - 모드: ${mode === "append" ? (smartMerge ? "스마트 병합" : "추가") : "덮어쓰기"}
+ - 업데이트된 셀: ${successCount}개${errorCount > 0 ? ` (오류: ${errorCount}개)` : ''}${backupMessage}`;
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: successText + "\n\n변경 사항이 Excel에 즉시 반영되었습니다.",
+              },
+            ],
+          };
+        } else {
+          // 실패했지만 파일 열기만 시도
           if (openFile) {
             await openExcelFile(filePath);
             return {
               content: [
                 {
                   type: "text",
-                  text: `데이터 업데이트 중 오류가 발생했지만 Excel 파일을 열기 시도했습니다: ${filePath}`,
+                  text: `데이터 업데이트는 실패했지만 Excel 파일을 열기 시도했습니다: ${filePath}`,
                 },
               ],
             };
@@ -559,7 +1016,9 @@ server.tool(
             content: [
               {
                 type: "text",
-                text: `엑셀 데이터 업데이트 오류: ${error.message}`,
+                text: `열려있는 엑셀 파일 업데이트 실패: ${
+                  result ? result.message : "알 수 없는 오류"
+                }`,
               },
             ],
             isError: true,
@@ -584,8 +1043,8 @@ server.tool(
           worksheet = workbook.getWorksheet(sheetName);
           if (!worksheet) {
             worksheet = workbook.addWorksheet(sheetName);
-          } else if (!append) {
-            // 덮어쓰기 모드인 경우만 기존 데이터 지우기
+          } else if (mode === "full") {
+            // full 모드에서는 기존 데이터 지우기
             const rowCount = worksheet.rowCount;
             for (let i = rowCount; i >= 1; i--) {
               worksheet.spliceRows(i, 1);
@@ -596,8 +1055,8 @@ server.tool(
             worksheet = workbook.addWorksheet("Sheet1");
           } else {
             worksheet = workbook.worksheets[0];
-            if (!append) {
-              // 덮어쓰기 모드인 경우만 기존 데이터 지우기
+            if (mode === "full") {
+              // full 모드에서는 기존 데이터 지우기
               const rowCount = worksheet.rowCount;
               for (let i = rowCount; i >= 1; i--) {
                 worksheet.spliceRows(i, 1);
@@ -606,13 +1065,17 @@ server.tool(
           }
         }
 
-        // 데이터 추가 방식 결정
-        if (append && worksheet.rowCount > 0) {
-          // 추가 모드: 기존 데이터 다음에 새 데이터 추가
-          worksheet.addRows(data);
-        } else {
-          // 덮어쓰기 모드 또는 빈 시트: 데이터 설정
-          worksheet.addRows(mergedData);
+        // 셀 단위로 업데이트
+        let successCount = 0;
+        let errorCells = [];
+
+        for (const cell of processCellData) {
+          try {
+            worksheet.getCell(cell.cellReference).value = cell.value;
+            successCount++;
+          } catch (err) {
+            errorCells.push(cell.cellReference);
+          }
         }
 
         // 파일 저장
@@ -628,15 +1091,26 @@ server.tool(
           backupMessage = `\n백업 생성됨: ${backupPath}`;
         }
 
+        // 모드에 따라 다른 성공 메시지 구성
+        let successText = "";
+        if (mode === "cells") {
+          successText = `엑셀 파일의 특정 셀들이 성공적으로 업데이트되었습니다:
+ - 파일: ${filePath}
+ - 시트: ${worksheet.name}
+ - 업데이트된 셀: ${successCount}개${errorCells.length > 0 ? ` (실패: ${errorCells.length}개)` : ''}${backupMessage}`;
+        } else {
+          successText = `엑셀 파일에 데이터가 성공적으로 업데이트되었습니다:
+ - 파일: ${filePath}
+ - 시트: ${worksheet.name}
+ - 모드: ${mode === "append" ? (smartMerge ? "스마트 병합" : "추가") : "덮어쓰기"}
+ - 업데이트된 셀: ${successCount}개${errorCells.length > 0 ? ` (실패: ${errorCells.length}개)` : ''}${backupMessage}`;
+        }
+
         return {
           content: [
             {
               type: "text",
-              text: `엑셀 파일이 성공적으로 업데이트되었습니다:
-- 파일: ${filePath}
-- 시트: ${worksheet.name}
-- 모드: ${append ? "추가" : "덮어쓰기"}
-- 행 수: ${mergedData.length}${backupMessage}`,
+              text: successText,
             },
           ],
         };
@@ -663,27 +1137,7 @@ server.tool(
       };
     }
   }
-);
-
-// Excel 프로세스 확인 및 대기 함수 추가
-async function waitForExcelAvailable(maxAttempts = 3) {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const result = await execPromise(
-        'powershell -Command "Get-Process excel -ErrorAction SilentlyContinue | Out-String"'
-      );
-      if (result && result.trim()) {
-        // Excel이 실행 중이면 잠시 대기
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        return true;
-      }
-    } catch (e) {
-      // 오류 무시
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return false;
-}
+)
 
 // 엑셀 파일 읽기 도구
 server.tool(
@@ -820,27 +1274,8 @@ server.tool(
           }
           `;
 
-          // 임시 PS1 파일 경로
-          const timestamp = Date.now();
-          const scriptPath = path.join(
-            process.cwd(),
-            `read_excel_${timestamp}.ps1`
-          );
-
-          // 스크립트를 파일로 저장
-          fs.writeFileSync(scriptPath, psScript);
-
           // PowerShell 스크립트 실행
-          const result = await execPromise(
-            `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-          );
-
-          // 임시 파일 삭제
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch (err) {
-            // 파일 삭제 오류는 무시
-          }
+          const result = await runPowerShellScript(psScript);
 
           // 결과 파싱
           if (result && !result.includes("ERROR:")) {
@@ -891,25 +1326,7 @@ server.tool(
               } catch {}
               `;
 
-              const activateScriptPath = path.join(
-                process.cwd(),
-                `activate_excel_${timestamp}.ps1`
-              );
-
-              fs.writeFileSync(activateScriptPath, activateScript);
-              try {
-                await execPromise(
-                  `powershell -ExecutionPolicy Bypass -File "${activateScriptPath}"`
-                );
-              } catch (e) {
-                // 무시
-              }
-
-              try {
-                fs.unlinkSync(activateScriptPath);
-              } catch (err) {
-                // 무시
-              }
+              await runPowerShellScript(activateScript);
             }
 
             // 결과 반환
@@ -1033,595 +1450,732 @@ server.tool(
   }
 );
 
-// 엑셀 셀 서식 지정 도구
-// server.tool(
-//   "format_excel",
-//   "엑셀 파일의 셀 서식을 지정합니다(배경색, 글꼴, 테두리 등).",
-//   {
-//     filePath: z.string().describe("서식을 적용할 엑셀 파일의 경로"),
-//     sheetName: z.string().optional().describe("서식을 적용할 시트 이름 (지정하지 않으면 활성 시트)"),
-//     ranges: z.array(z.object({
-//       range: z.string().describe("서식을 적용할 셀 범위 (예: 'A1:C5')"),
-//       bold: z.boolean().optional().describe("굵은 글씨 적용 여부"),
-//       italic: z.boolean().optional().describe("기울임꼴 적용 여부"),
-//       underline: z.boolean().optional().describe("밑줄 적용 여부"),
-//       fontSize: z.number().optional().describe("글꼴 크기"),
-//       fontName: z.string().optional().describe("글꼴 이름"),
-//       border: z.object({
-//         top: z.boolean().optional(),
-//         right: z.boolean().optional(),
-//         bottom: z.boolean().optional(),
-//         left: z.boolean().optional(),
-//         style: z.string().optional().describe("테두리 스타일 (thin, medium, thick 등)")
-//       }).optional().describe("셀 테두리 설정"),
-//       alignment: z.object({
-//         horizontal: z.string().optional().describe("가로 정렬 (left, center, right)"),
-//         vertical: z.string().optional().describe("세로 정렬 (top, middle, bottom)")
-//       }).optional().describe("텍스트 정렬 설정"),
-//       autoFit: z.boolean().optional().describe("열 너비 자동 맞춤 여부")
-//     })).describe("서식을 적용할 범위 및 설정 목록"),
-//     columnWidths: z.array(z.object({
-//       column: z.string().describe("열 문자(A, B, C 등)"),
-//       width: z.number().describe("설정할 너비 (문자 단위)")
-//     })).optional().describe("열 너비 설정 목록"),
-//     rowHeights: z.array(z.object({
-//       row: z.number().describe("행 번호"),
-//       height: z.number().describe("설정할 높이 (포인트 단위)")
-//     })).optional().describe("행 높이 설정 목록"),
-//     mergeCells: z.array(z.string()).optional().describe("병합할 셀 범위 목록 (예: ['A1:B2', 'C3:E5'])"),
-//     openFile: z.boolean().optional().default(false).describe("저장 후 Excel로 열지 여부")
-//   },
-//   async ({ filePath, sheetName, ranges, columnWidths, rowHeights, mergeCells, openFile }) => {
-//     try {
-//       // 파일 존재 확인
-//       if (!fs.existsSync(filePath)) {
-//         return {
-//           content: [
-//             { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
-//           ],
-//           isError: true,
-//         };
-//       }
-
-//       // 파일이 열려있는지 확인
-//       let isFileOpen = false;
-//       try {
-//         const fd = fs.openSync(filePath, "r+");
-//         fs.closeSync(fd);
-//       } catch (e) {
-//         isFileOpen = true;
-//       }
-
-//       // 파일이 열려있는 경우 COM 인터페이스로 처리
-//       if (isFileOpen) {
-//         try {
-//           // PowerShell 스크립트 작성
-//           let psScript = `
-//           try {
-//             # Excel 애플리케이션 객체 생성 또는 가져오기
-//             try {
-//               $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
-//             } catch {
-//               $excel = New-Object -ComObject Excel.Application
-//             }
-
-//             $excel.Visible = $true
-//             $excel.DisplayAlerts = $false
-
-//             # 파일 열기 시도
-//             $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
-
-//             # 이미 열려있는 워크북 찾기
-//             $workbook = $null
-//             foreach ($wb in $excel.Workbooks) {
-//               if ($wb.FullName -eq $normalizedPath) {
-//                 $workbook = $wb
-//                 break
-//               }
-//             }
-
-//             # 워크북이 없으면 열기
-//             if ($workbook -eq $null) {
-//               $workbook = $excel.Workbooks.Open($normalizedPath)
-//             }
-
-//             # 시트 선택
-//             $worksheet = $null
-//           `;
-
-//           if (sheetName) {
-//             psScript += `
-//             try {
-//               $worksheet = $workbook.Worksheets("${sheetName}")
-//             } catch {
-//               $worksheet = $workbook.ActiveSheet
-//             }
-//             `;
-//           } else {
-//             psScript += `
-//             $worksheet = $workbook.ActiveSheet
-//             `;
-//           }
-
-//           // 범위별 서식 설정
-//           if (ranges && ranges.length > 0) {
-//             for (const [index, rangeObj] of ranges.entries()) {
-//               const { range, bold, italic, underline, fontSize, fontName, border, alignment, autoFit } = rangeObj;
-
-//               psScript += `
-//               # 범위 ${index + 1} 서식 설정
-//               $range = $worksheet.Range("${range}")
-//               `;
-
-//               // 글꼴 스타일 설정
-//               psScript += `
-//               $font = $range.Font
-//               `;
-
-//               if (bold === true) {
-//                 psScript += `
-//                 $font.Bold = $true
-//                 `;
-//               }
-
-//               if (italic === true) {
-//                 psScript += `
-//                 $font.Italic = $true
-//                 `;
-//               }
-
-//               if (underline === true) {
-//                 psScript += `
-//                 $font.Underline = $true
-//                 `;
-//               }
-
-//               if (fontSize) {
-//                 psScript += `
-//                 $font.Size = ${fontSize}
-//                 `;
-//               }
-
-//               if (fontName) {
-//                 psScript += `
-//                 $font.Name = "${fontName}"
-//                 `;
-//               }
-
-//               // 테두리 설정
-//               if (border) {
-//                 const borderStyle = border.style || "xlThin";
-//                 const borderConstant = getBorderStyleConstant(borderStyle);
-
-//                 if (border.top) {
-//                   psScript += `
-//                   $range.Borders.Item(1).LineStyle = ${borderConstant}
-//                   `;
-//                 }
-//                 if (border.left) {
-//                   psScript += `
-//                   $range.Borders.Item(3).LineStyle = ${borderConstant}
-//                   `;
-//                 }
-//                 if (border.bottom) {
-//                   psScript += `
-//                   $range.Borders.Item(2).LineStyle = ${borderConstant}
-//                   `;
-//                 }
-//                 if (border.right) {
-//                   psScript += `
-//                   $range.Borders.Item(4).LineStyle = ${borderConstant}
-//                   `;
-//                 }
-//               }
-
-//               // 정렬 설정
-//               if (alignment) {
-//                 if (alignment.horizontal) {
-//                   const horizontalAlignment = getHorizontalAlignmentConstant(alignment.horizontal);
-//                   psScript += `
-//                   $range.HorizontalAlignment = ${horizontalAlignment}
-//                   `;
-//                 }
-
-//                 if (alignment.vertical) {
-//                   const verticalAlignment = getVerticalAlignmentConstant(alignment.vertical);
-//                   psScript += `
-//                   $range.VerticalAlignment = ${verticalAlignment}
-//                   `;
-//                 }
-//               }
-
-//               // 자동 맞춤 설정
-//               if (autoFit === true) {
-//                 psScript += `
-//                 $range.EntireColumn.AutoFit() | Out-Null
-//                 `;
-//               }
-//             }
-//           }
-
-//           // 열 너비 설정
-//           if (columnWidths && columnWidths.length > 0) {
-//             for (const columnWidth of columnWidths) {
-//               psScript += `
-//               # 열 너비 설정: ${columnWidth.column} = ${columnWidth.width}
-//               $worksheet.Columns("${columnWidth.column}:${columnWidth.column}").ColumnWidth = ${columnWidth.width}
-//               `;
-//             }
-//           }
-
-//           // 행 높이 설정
-//           if (rowHeights && rowHeights.length > 0) {
-//             for (const rowHeight of rowHeights) {
-//               psScript += `
-//               # 행 높이 설정: ${rowHeight.row} = ${rowHeight.height}
-//               $worksheet.Rows("${rowHeight.row}:${rowHeight.row}").RowHeight = ${rowHeight.height}
-//               `;
-//             }
-//           }
-
-//           // 셀 병합
-//           if (mergeCells && mergeCells.length > 0) {
-//             for (const mergeRange of mergeCells) {
-//               psScript += `
-//               # 셀 병합: ${mergeRange}
-//               $worksheet.Range("${mergeRange}").Merge() | Out-Null
-//               `;
-//             }
-//           }
-
-//           // 저장 및 정리
-//           psScript += `
-//             # 저장
-//             $workbook.Save()
-
-//             Write-Output "SUCCESS: 엑셀 파일 서식이 성공적으로 적용되었습니다."
-//           } catch {
-//             Write-Output "ERROR: $($_.Exception.Message)"
-//           } finally {
-//             if ($excel -ne $null) {
-//               $excel.DisplayAlerts = $true
-//             }
-//           }
-//           `;
-
-//           // 임시 PS1 파일 경로
-//           const timestamp = Date.now();
-//           const scriptPath = path.join(
-//             process.cwd(),
-//             `format_excel_${timestamp}.ps1`
-//           );
-
-//           // 스크립트를 파일로 저장
-//           fs.writeFileSync(scriptPath, psScript);
-
-//           // PowerShell 스크립트 실행
-//           const result = await execPromise(
-//             `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-//           );
-
-//           // 임시 파일 삭제
-//           try {
-//             fs.unlinkSync(scriptPath);
-//           } catch (err) {
-//             // 파일 삭제 오류는 무시
-//           }
-
-//           // 결과 확인
-//           if (result && result.includes("SUCCESS")) {
-//             // 요청 시 Excel로 파일 열기
-//             if (openFile) {
-//               await openExcelFile(filePath);
-//             }
-
-//             return {
-//               content: [
-//                 {
-//                   type: "text",
-//                   text: `엑셀 파일 서식이 성공적으로 적용되었습니다.
-// - 적용된 범위: ${ranges ? ranges.length : 0}개
-// - 열 너비 설정: ${columnWidths ? columnWidths.length : 0}개
-// - 행 높이 설정: ${rowHeights ? rowHeights.length : 0}개
-// - 셀 병합: ${mergeCells ? mergeCells.length : 0}개`
-//                 },
-//               ],
-//             };
-//           } else {
-//             return {
-//               content: [
-//                 {
-//                   type: "text",
-//                   text: result ? result.trim() : "서식 적용 중 오류가 발생했습니다.",
-//                 },
-//               ],
-//               isError: true,
-//             };
-//           }
-//         } catch (error) {
-//           return {
-//             content: [
-//               { type: "text", text: `서식 적용 오류: ${error.message}` },
-//             ],
-//             isError: true,
-//           };
-//         }
-//       } else {
-//         // 파일이 열려있지 않은 경우 ExcelJS 사용
-//         const workbook = new ExcelJS.Workbook();
-
-//         try {
-//           // 엑셀 파일 읽기
-//           await workbook.xlsx.readFile(filePath);
-//         } catch (readErr) {
-//           return {
-//             content: [
-//               {
-//                 type: "text",
-//                 text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
-//               },
-//             ],
-//             isError: true,
-//           };
-//         }
-
-//         // 시트 선택
-//         let worksheet;
-//         if (sheetName) {
-//           worksheet = workbook.getWorksheet(sheetName);
-//           if (!worksheet) {
-//             worksheet = workbook.worksheets[0];
-//           }
-//         } else {
-//           worksheet = workbook.worksheets[0];
-//         }
-
-//         if (!worksheet) {
-//           return {
-//             content: [
-//               { type: "text", text: "작업할 워크시트가 없습니다." },
-//             ],
-//             isError: true,
-//           };
-//         }
-
-//         // 범위별 서식 설정
-//         if (ranges && ranges.length > 0) {
-//           for (const rangeObj of ranges) {
-//             const { range, bold, italic, underline, fontSize, fontName, border, alignment } = rangeObj;
-
-//             // 범위 분석 (예: "A1:C5")
-//             const rangeAddresses = range.split(':');
-//             const startCell = worksheet.getCell(rangeAddresses[0]);
-//             const endCell = rangeAddresses.length > 1 ? worksheet.getCell(rangeAddresses[1]) : startCell;
-
-//             const startRow = startCell.row;
-//             const startCol = startCell.col;
-//             const endRow = endCell.row;
-//             const endCol = endCell.col;
-
-//             // 범위 내 각 셀에 스타일 적용
-//             for (let row = startRow; row <= endRow; row++) {
-//               for (let col = startCol; col <= endCol; col++) {
-//                 const cell = worksheet.getCell(row, col);
-
-//                 // 새 스타일 객체 생성
-//                 if (!cell.style) {
-//                   cell.style = {};
-//                 }
-
-//                 // 글꼴 스타일 설정
-//                 if (!cell.font) {
-//                   cell.font = {};
-//                 }
-
-//                 if (bold === true) {
-//                   cell.font.bold = true;
-//                 }
-
-//                 if (italic === true) {
-//                   cell.font.italic = true;
-//                 }
-
-//                 if (underline === true) {
-//                   cell.font.underline = true;
-//                 }
-
-//                 if (fontSize) {
-//                   cell.font.size = fontSize;
-//                 }
-
-//                 if (fontName) {
-//                   cell.font.name = fontName;
-//                 }
-
-//                 // 테두리 설정
-//                 if (border) {
-//                   if (!cell.border) {
-//                     cell.border = {};
-//                   }
-
-//                   const style = border.style || 'thin';
-
-//                   if (border.top) {
-//                     cell.border.top = { style };
-//                   }
-
-//                   if (border.left) {
-//                     cell.border.left = { style };
-//                   }
-
-//                   if (border.bottom) {
-//                     cell.border.bottom = { style };
-//                   }
-
-//                   if (border.right) {
-//                     cell.border.right = { style };
-//                   }
-//                 }
-
-//                 // 정렬 설정
-//                 if (alignment) {
-//                   if (!cell.alignment) {
-//                     cell.alignment = {};
-//                   }
-
-//                   if (alignment.horizontal) {
-//                     cell.alignment.horizontal = alignment.horizontal;
-//                   }
-
-//                   if (alignment.vertical) {
-//                     cell.alignment.vertical = alignment.vertical;
-//                   }
-//                 }
-//               }
-//             }
-
-//             // 자동 맞춤 (ExcelJS에서는 저장 후 Excel에서 열어야 함)
-//             if (rangeObj.autoFit === true) {
-//               for (let col = startCol; col <= endCol; col++) {
-//                 worksheet.getColumn(col).width = 15; // 대략적인 자동 맞춤
-//               }
-//             }
-//           }
-//         }
-
-//         // 열 너비 설정
-//         if (columnWidths && columnWidths.length > 0) {
-//           for (const columnWidth of columnWidths) {
-//             const col = worksheet.getColumn(columnWidth.column);
-//             if (col) {
-//               col.width = columnWidth.width;
-//             }
-//           }
-//         }
-
-//         // 행 높이 설정
-//         if (rowHeights && rowHeights.length > 0) {
-//           for (const rowHeight of rowHeights) {
-//             const row = worksheet.getRow(rowHeight.row);
-//             if (row) {
-//               row.height = rowHeight.height;
-//             }
-//           }
-//         }
-
-//         // 셀 병합
-//         if (mergeCells && mergeCells.length > 0) {
-//           for (const mergeRange of mergeCells) {
-//             worksheet.mergeCells(mergeRange);
-//           }
-//         }
-
-//         // 파일 저장
-//         await workbook.xlsx.writeFile(filePath);
-
-//         // 요청 시 Excel로 파일 열기
-//         if (openFile) {
-//           await openExcelFile(filePath);
-//         }
-
-//         return {
-//           content: [
-//             {
-//               type: "text",
-//               text: `엑셀 파일 서식이 성공적으로 적용되었습니다.
-// - 적용된 범위: ${ranges ? ranges.length : 0}개
-// - 열 너비 설정: ${columnWidths ? columnWidths.length : 0}개
-// - 행 높이 설정: ${rowHeights ? rowHeights.length : 0}개
-// - 셀 병합: ${mergeCells ? mergeCells.length : 0}개`,
-//             },
-//           ],
-//         };
-//       }
-//     } catch (error) {
-//       return {
-//         content: [
-//           { type: "text", text: `엑셀 서식 적용 오류: ${error.message}` },
-//         ],
-//         isError: true,
-//       };
-//     }
-//   }
-// );
-
-// 테두리 스타일 상수 반환
-function getBorderStyleConstant(style) {
-  const styleMap = {
-    thin: 1,
-    medium: 2,
-    dashed: 3,
-    dotted: 4,
-    thick: 5,
-    double: 6,
-    none: -4142,
-  };
-
-  return styleMap[style.toLowerCase()] || 1;
-}
-
-// 가로 정렬 상수 반환
-function getHorizontalAlignmentConstant(alignment) {
-  const alignmentMap = {
-    left: -4131,
-    center: -4108,
-    right: -4152,
-    general: 1,
-  };
-
-  return alignmentMap[alignment.toLowerCase()] || 1;
-}
-
-// 세로 정렬 상수 반환
-function getVerticalAlignmentConstant(alignment) {
-  const alignmentMap = {
-    top: -4160,
-    middle: -4108,
-    bottom: -4107,
-  };
-
-  return alignmentMap[alignment.toLowerCase()] || -4108;
-}
-
-// 테두리 스타일 상수 반환
-function getBorderStyleConstant(style) {
-  const styleMap = {
-    thin: 1,
-    medium: 2,
-    dashed: 3,
-    dotted: 4,
-    thick: 5,
-    double: 6,
-    none: -4142,
-  };
-
-  return styleMap[style.toLowerCase()] || 1;
-}
-
-// 가로 정렬 상수 반환
-function getHorizontalAlignmentConstant(alignment) {
-  const alignmentMap = {
-    left: -4131,
-    center: -4108,
-    right: -4152,
-    general: 1,
-  };
-
-  return alignmentMap[alignment.toLowerCase()] || 1;
-}
-
-// 세로 정렬 상수 반환
-function getVerticalAlignmentConstant(alignment) {
-  const alignmentMap = {
-    top: -4160,
-    middle: -4108,
-    bottom: -4107,
-  };
-
-  return alignmentMap[alignment.toLowerCase()] || -4108;
-}
-
-// 열려있는 엑셀 파일 목록 조회 도구
+// 시트 추가 도구
+server.tool(
+  "add_sheet",
+  "엑셀 파일에 새 시트를 추가합니다.",
+  {
+    filePath: z.string().describe("엑셀 파일의 경로"),
+    sheetName: z.string().describe("추가할 시트 이름"),
+    data: z
+      .array(z.array(z.any()))
+      .optional()
+      .describe("시트에 추가할 2차원 배열 형태의 데이터 (선택사항)"),
+    openFile: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
+  },
+  async ({ filePath, sheetName, data = [], openFile }) => {
+    try {
+      // 파일 존재 확인
+      if (!fs.existsSync(filePath)) {
+        return {
+          content: [
+            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
+          ],
+          isError: true,
+        };
+      }
+
+      // 1. 파일이 열려있는지 확인
+      const fileIsOpen = isFileOpen(filePath);
+
+      // 2. 파일이 열려있다면, PowerShell로 시트 추가
+      if (fileIsOpen) {
+        try {
+          // PowerShell 스크립트 작성
+          const psScript = `
+          try {
+              # Excel 애플리케이션 객체 생성 또는 가져오기
+              try {
+                  $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+              } catch {
+                  $excel = New-Object -ComObject Excel.Application
+              }
+              
+              $excel.Visible = $true
+              $excel.DisplayAlerts = $false
+              
+              # 파일 열기 시도
+              $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
+              
+              # 이미 열려있는 워크북 찾기
+              $workbook = $null
+              foreach ($wb in $excel.Workbooks) {
+                  if ($wb.FullName -eq $normalizedPath) {
+                      $workbook = $wb
+                      break
+                  }
+              }
+              
+              # 워크북이 없으면 열기
+              if ($workbook -eq $null) {
+                  $workbook = $excel.Workbooks.Open($normalizedPath)
+              }
+              
+              # 워크북 활성화
+              $workbook.Activate()
+              
+              # 시트 이름 중복 검사
+              $sheetExists = $false
+              foreach ($sheet in $workbook.Sheets) {
+                  if ($sheet.Name -eq "${sheetName}") {
+                      $sheetExists = $true
+                      break
+                  }
+              }
+              
+              if ($sheetExists) {
+                  Write-Output "ERROR: 시트 이름 '${sheetName}'이(가) 이미 존재합니다."
+                  return
+              }
+              
+              # 새 시트 추가
+              $newSheet = $workbook.Worksheets.Add()
+              $newSheet.Name = "${sheetName}"
+              
+              # 시트 활성화
+              $newSheet.Activate()
+              
+              # 데이터 추가 (있는 경우)
+              ${
+                data.length > 0
+                  ? `
+              # 데이터 작성
+              $rowCount = ${data.length}
+              $colCount = ${Math.max(
+                  ...data.map((row) => row.length)
+                )}
+              
+          # 데이터를 한 번에 설정할 범위 생성
+              $targetRange = $newSheet.Range($newSheet.Cells(1, 1), $newSheet.Cells($rowCount, $colCount))
+              
+              # 2차원 배열 생성
+              $dataArray = New-Object 'object[,]' $rowCount, $colCount
+              
+              ${data
+                .map((row, rowIndex) => {
+                  return row
+                    .map((cell, colIndex) => {
+                      // 값 타입에 따른 처리
+                      if (typeof cell === "string") {
+                        // 문자열은 따옴표로 묶고 특수문자 처리
+                        const escapedValue = cell
+                          .replace(/'/g, "''")
+                          .replace(/"/g, '""');
+                        return `$dataArray[${rowIndex}, ${colIndex}] = '${escapedValue}'`;
+                      } else if (
+                        cell === null ||
+                        cell === undefined
+                      ) {
+                        // null/undefined는 빈 문자열로
+                        return `$dataArray[${rowIndex}, ${colIndex}] = ''`;
+                      } else if (typeof cell === "number") {
+                        // 숫자는 그대로
+                        return `$dataArray[${rowIndex}, ${colIndex}] = ${cell}`;
+                      } else if (typeof cell === "boolean") {
+                        // 불리언 값 처리
+                        return `$dataArray[${rowIndex}, ${colIndex}] = $${cell}`;
+                      } else {
+                        // 기타 값은 문자열로 변환
+                        return `$dataArray[${rowIndex}, ${colIndex}] = '${String(
+                          cell
+                        ).replace(/'/g, "''")}'`;
+                      }
+                    })
+                    .join("\n");
+                })
+                .join("\n")}
+              
+              # 데이터 배열을 범위에 한 번에 설정
+              $targetRange.Value2 = $dataArray
+              
+              # 자동 맞춤 적용 (열 너비 자동 조절)
+              $newSheet.UsedRange.Columns.AutoFit() | Out-Null
+              `
+                  : ""
+              }
+              
+              # 저장
+              $workbook.Save()
+              
+              Write-Output "SUCCESS: 새 시트 '${sheetName}'이(가) 성공적으로 추가되었습니다."
+          } catch {
+              Write-Output "ERROR: $($_.Exception.Message)"
+          } finally {
+              if ($excel -ne $null) {
+                  $excel.DisplayAlerts = $true
+              }
+          }
+          `;
+
+          // PowerShell 스크립트 실행
+          const result = await runPowerShellScript(psScript);
+
+          // 결과 확인
+          if (result && result.includes("SUCCESS")) {
+            // 요청 시 Excel로 파일 열기
+            if (openFile) {
+              await openExcelFile(filePath);
+            }
+
+            return {
+              content: [{ type: "text", text: result.trim() }],
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: result
+                    ? result.trim()
+                    : "시트 추가 중 오류가 발생했습니다.",
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (error) {
+          return {
+            content: [
+              { type: "text", text: `시트 추가 오류: ${error.message}` },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // 3. 파일이 열려있지 않은 경우 ExcelJS 사용
+      // ExcelJS 워크북 생성
+      const workbook = new ExcelJS.Workbook();
+
+      try {
+        // 엑셀 파일 읽기
+        await workbook.xlsx.readFile(filePath);
+      } catch (readErr) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 시트 이름 중복 확인
+      if (workbook.getWorksheet(sheetName)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `시트 이름 '${sheetName}'이(가) 이미 존재합니다.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 새 워크시트 추가
+      const worksheet = workbook.addWorksheet(sheetName);
+
+      // 데이터가 있는 경우 추가
+      if (data.length > 0) {
+        worksheet.addRows(data);
+      }
+
+      // 파일 저장
+      await workbook.xlsx.writeFile(filePath);
+
+      // 요청 시 Excel로 파일 열기
+      if (openFile) {
+        await openExcelFile(filePath);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `새 시트 '${sheetName}'이(가) 성공적으로 추가되었습니다.${
+              data.length > 0
+                ? ` ${data.length}행의 데이터가 추가되었습니다.`
+                : ""
+            }`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `시트 추가 오류: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 시트 이름 변경 도구
+server.tool(
+  "rename_sheet",
+  "엑셀 파일에서 시트 이름을 변경합니다.",
+  {
+    filePath: z.string().describe("엑셀 파일의 경로"),
+    currentSheetName: z.string().describe("현재 시트 이름"),
+    newSheetName: z.string().describe("변경할 새 시트 이름"),
+    openFile: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
+  },
+  async ({ filePath, currentSheetName, newSheetName, openFile }) => {
+    try {
+      // 파일 존재 확인
+      if (!fs.existsSync(filePath)) {
+        return {
+          content: [
+            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
+          ],
+          isError: true,
+        };
+      }
+
+      // 새 시트 이름 유효성 검사
+      if (newSheetName.length > 31) {
+        return {
+          content: [
+            { type: "text", text: "시트 이름은 31자를 초과할 수 없습니다." },
+          ],
+          isError: true,
+        };
+      }
+
+      // 시트 이름에 유효하지 않은 문자가 있는지 확인
+      const invalidChars = ["/", "\\", "?", "*", "[", "]", ":", "'"];
+      for (const char of invalidChars) {
+        if (newSheetName.includes(char)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `시트 이름에는 다음 문자를 포함할 수 없습니다: ${invalidChars.join(
+                  " "
+                )}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // 파일이 열려있는지 확인
+      const fileIsOpen = isFileOpen(filePath);
+
+      // 파일이 열려있다면, PowerShell로 시트 이름 변경
+      if (fileIsOpen) {
+        try {
+          // PowerShell 스크립트 작성
+          const psScript = `
+          try {
+            # Excel 애플리케이션 객체 생성 또는 가져오기
+            try {
+              $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+            } catch {
+              $excel = New-Object -ComObject Excel.Application
+            }
+            
+            $excel.Visible = $true
+            $excel.DisplayAlerts = $false
+            
+            # 파일 열기 시도
+            $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
+            
+            # 이미 열려있는 워크북 찾기
+            $workbook = $null
+            foreach ($wb in $excel.Workbooks) {
+              if ($wb.FullName -eq $normalizedPath) {
+                $workbook = $wb
+                break
+              }
+            }
+            
+            # 워크북이 없으면 열기
+            if ($workbook -eq $null) {
+              $workbook = $excel.Workbooks.Open($normalizedPath)
+            }
+            
+            # 워크북 활성화
+            $workbook.Activate()
+            
+            # 시트 찾기
+            $sheetExists = $false
+            $worksheet = $null
+            
+            foreach ($sheet in $workbook.Sheets) {
+              if ($sheet.Name -eq "${currentSheetName}") {
+                $sheetExists = $true
+                $worksheet = $sheet
+                break
+              }
+            }
+            
+            if (-not $sheetExists) {
+              Write-Output "ERROR: 시트 이름 '${currentSheetName}'을(를) 찾을 수 없습니다."
+              return
+            }
+            
+            # 동일한 이름의 시트가 이미 있는지 확인
+            foreach ($sheet in $workbook.Sheets) {
+              if ($sheet.Name -eq "${newSheetName}") {
+                Write-Output "ERROR: 시트 이름 '${newSheetName}'이(가) 이미 존재합니다."
+                return
+              }
+            }
+            
+            # 시트 이름 변경
+            $worksheet.Name = "${newSheetName}"
+            
+            # 저장
+            $workbook.Save()
+            
+            Write-Output "SUCCESS: 시트 이름이 '${currentSheetName}'에서 '${newSheetName}'(으)로 성공적으로 변경되었습니다."
+          } catch {
+            Write-Output "ERROR: $($_.Exception.Message)"
+          } finally {
+            if ($excel -ne $null) {
+              $excel.DisplayAlerts = $true
+            }
+          }
+          `;
+
+          // PowerShell 스크립트 실행
+          const result = await runPowerShellScript(psScript);
+
+          // 결과 확인
+          if (result && result.includes("SUCCESS")) {
+            // 요청 시 Excel로 파일 열기
+            if (openFile) {
+              await openExcelFile(filePath);
+            }
+
+            return {
+              content: [{ type: "text", text: result.trim() }],
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: result
+                    ? result.trim()
+                    : "시트 이름 변경 중 오류가 발생했습니다.",
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (error) {
+          return {
+            content: [
+              { type: "text", text: `시트 이름 변경 오류: ${error.message}` },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // 파일이 열려있지 않은 경우 ExcelJS 사용
+      const workbook = new ExcelJS.Workbook();
+
+      try {
+        // 엑셀 파일 읽기
+        await workbook.xlsx.readFile(filePath);
+      } catch (readErr) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 현재 시트 이름 존재 확인
+      const worksheet = workbook.getWorksheet(currentSheetName);
+      if (!worksheet) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `시트 이름 '${currentSheetName}'을(를) 찾을 수 없습니다.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 새 시트 이름 중복 확인
+      if (workbook.getWorksheet(newSheetName)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `시트 이름 '${newSheetName}'이(가) 이미 존재합니다.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 시트 이름 변경
+      worksheet.name = newSheetName;
+
+      // 파일 저장
+      await workbook.xlsx.writeFile(filePath);
+
+      // 요청 시 Excel로 파일 열기
+      if (openFile) {
+        await openExcelFile(filePath);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `시트 이름이 '${currentSheetName}'에서 '${newSheetName}'(으)로 성공적으로 변경되었습니다.`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          { type: "text", text: `시트 이름 변경 오류: ${error.message}` },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// 시트 삭제 도구
+server.tool(
+  "delete_sheet",
+  "엑셀 파일에서 시트를 삭제합니다.",
+  {
+    filePath: z.string().describe("엑셀 파일의 경로"),
+    sheetName: z.string().describe("삭제할 시트 이름"),
+    openFile: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
+  },
+  async ({ filePath, sheetName, openFile }) => {
+    try {
+      // 파일 존재 확인
+      if (!fs.existsSync(filePath)) {
+        return {
+          content: [
+            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
+          ],
+          isError: true,
+        };
+      }
+
+      // 파일이 열려있는지 확인
+      const fileIsOpen = isFileOpen(filePath);
+
+      // 파일이 열려있다면, PowerShell로 시트 삭제
+      if (fileIsOpen) {
+        try {
+          // PowerShell 스크립트 작성
+          const psScript = `
+          try {
+              # Excel 애플리케이션 객체 생성 또는 가져오기
+              try {
+                  $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+              } catch {
+                  $excel = New-Object -ComObject Excel.Application
+              }
+              
+              $excel.Visible = $true
+              $excel.DisplayAlerts = $false
+              
+              # 파일 열기 시도
+              $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
+              
+              # 이미 열려있는 워크북 찾기
+              $workbook = $null
+              foreach ($wb in $excel.Workbooks) {
+                  if ($wb.FullName -eq $normalizedPath) {
+                      $workbook = $wb
+                      break
+                  }
+              }
+              
+              # 워크북이 없으면 열기
+              if ($workbook -eq $null) {
+                  $workbook = $excel.Workbooks.Open($normalizedPath)
+              }
+              
+              # 워크북 활성화
+              $workbook.Activate()
+              
+              # 시트가 존재하는지 확인
+              $sheetExists = $false
+              $worksheet = $null
+              
+              foreach ($sheet in $workbook.Sheets) {
+                  if ($sheet.Name -eq "${sheetName}") {
+                      $sheetExists = $true
+                      $worksheet = $sheet
+                      break
+                  }
+              }
+              
+              if (-not $sheetExists) {
+                  Write-Output "ERROR: 시트 이름 '${sheetName}'을(를) 찾을 수 없습니다."
+                  return
+              }
+              
+              # 시트가 마지막 시트인지 확인 (Excel은 항상 최소 1개의 시트가 있어야 함)
+              if ($workbook.Sheets.Count -eq 1) {
+                  Write-Output "ERROR: 마지막 남은 시트는 삭제할 수 없습니다. Excel 파일에는 최소 하나의 시트가 있어야 합니다."
+                  return
+              }
+              
+              # 시트 삭제
+              $worksheet.Delete()
+              
+              # 저장
+              $workbook.Save()
+              
+              Write-Output "SUCCESS: 시트 '${sheetName}'이(가) 성공적으로 삭제되었습니다."
+          } catch {
+              Write-Output "ERROR: $($_.Exception.Message)"
+          } finally {
+              if ($excel -ne $null) {
+                  $excel.DisplayAlerts = $true
+              }
+          }
+          `;
+
+          // PowerShell 스크립트 실행
+          const result = await runPowerShellScript(psScript);
+
+          // 결과 확인
+          if (result && result.includes("SUCCESS")) {
+            // 요청 시 Excel로 파일 열기
+            if (openFile) {
+              await openExcelFile(filePath);
+            }
+
+            return {
+              content: [{ type: "text", text: result.trim() }],
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: result
+                    ? result.trim()
+                    : "시트 삭제 중 오류가 발생했습니다.",
+                },
+              ],
+              isError: true,
+            };
+          }
+        } catch (error) {
+          return {
+            content: [
+              { type: "text", text: `시트 삭제 오류: ${error.message}` },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // 파일이 열려있지 않은 경우 ExcelJS 사용
+      const workbook = new ExcelJS.Workbook();
+
+      try {
+        // 엑셀 파일 읽기
+        await workbook.xlsx.readFile(filePath);
+      } catch (readErr) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 시트 존재 확인
+      const worksheet = workbook.getWorksheet(sheetName);
+      if (!worksheet) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `시트 이름 '${sheetName}'을(를) 찾을 수 없습니다.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 워크북에 시트가 하나만 있는지 확인
+      if (workbook.worksheets.length === 1) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "마지막 남은 시트는 삭제할 수 없습니다. Excel 파일에는 최소 하나의 시트가 있어야 합니다.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // 시트 삭제
+      workbook.removeWorksheet(worksheet.id);
+
+      // 파일 저장
+      await workbook.xlsx.writeFile(filePath);
+
+      // 요청 시 Excel로 파일 열기
+      if (openFile) {
+        await openExcelFile(filePath);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `시트 '${sheetName}'이(가) 성공적으로 삭제되었습니다.`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `시트 삭제 오류: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+
+
+// 열려있는 Excel 파일 목록 조회 도구
 server.tool(
   "list_open_excel_files",
   "현재 PC에서 열려있는 모든 Excel 파일 목록을 조회합니다.",
@@ -1634,7 +2188,7 @@ server.tool(
   },
   async ({ details }) => {
     try {
-      // 더 간단하고 직접적인 PowerShell 스크립트 작성
+      // PowerShell 스크립트 작성
       const psScript = `
       try {
         # Excel 프로세스 확인
@@ -1718,25 +2272,8 @@ server.tool(
       }
       `;
 
-      // 임시 파일로 PowerShell 스크립트 저장
-      const timestamp = Date.now();
-      const scriptPath = path.join(
-        process.cwd(),
-        `excel_list_${timestamp}.ps1`
-      );
-      fs.writeFileSync(scriptPath, psScript);
-
-      // 표준 출력 및 오류를 모두 캡처하기 위한 실행 방법
-      const result = await execPromise(
-        `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-      );
-
-      // 임시 파일 정리
-      try {
-        fs.unlinkSync(scriptPath);
-      } catch (e) {
-        // 파일 삭제 오류 무시
-      }
+      // PowerShell 스크립트 실행
+      const result = await runPowerShellScript(psScript);
 
       // 결과 파싱 및 정보 추출
       const lines = result
@@ -2031,27 +2568,8 @@ server.tool(
       }
       `;
 
-      // 임시 PS1 파일 경로
-      const timestamp = Date.now();
-      const scriptPath = path.join(
-        process.cwd(),
-        `close_excel_${timestamp}.ps1`
-      );
-
-      // 스크립트를 파일로 저장
-      fs.writeFileSync(scriptPath, psScript);
-
       // PowerShell 스크립트 실행
-      const result = await execPromise(
-        `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-      );
-
-      // 임시 파일 삭제
-      try {
-        fs.unlinkSync(scriptPath);
-      } catch (err) {
-        // 파일 삭제 오류는 무시
-      }
+      const result = await runPowerShellScript(psScript);
 
       // 결과 파싱 및 응답 생성
       const lines = result
@@ -2124,832 +2642,6 @@ server.tool(
             text: `Excel 파일 닫기 중 오류가 발생했습니다: ${error.message}`,
           },
         ],
-        isError: true,
-      };
-    }
-  }
-);
-
-// 여러 번 시도하는 래퍼 함수
-async function retryUpdateExcel(filePath, sheetName, data, maxAttempts = 3) {
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      // Excel 프로세스 확인 및 대기
-      await waitForExcelAvailable();
-
-      const result = await updateOpenExcelByRange(filePath, sheetName, data);
-      if (result && result.success) {
-        return result;
-      }
-    } catch (e) {
-      console.error(`시도 ${i + 1}/${maxAttempts} 실패:`, e.message);
-    }
-    // 다음 시도 전 잠시 대기
-    await new Promise((resolve) => setTimeout(resolve, 1000 * (i + 1))); // 점진적으로 대기 시간 증가
-  }
-  throw new Error(`${maxAttempts}번 시도 후에도 Excel 파일 업데이트 실패`);
-}
-
-// 시트 추가 도구
-server.tool(
-  "add_sheet",
-  "엑셀 파일에 새 시트를 추가합니다.",
-  {
-    filePath: z.string().describe("엑셀 파일의 경로"),
-    sheetName: z.string().describe("추가할 시트 이름"),
-    data: z
-      .array(z.array(z.any()))
-      .optional()
-      .describe("시트에 추가할 2차원 배열 형태의 데이터 (선택사항)"),
-    openFile: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
-  },
-  async ({ filePath, sheetName, data = [], openFile }) => {
-    try {
-      // 파일 존재 확인
-      if (!fs.existsSync(filePath)) {
-        return {
-          content: [
-            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
-          ],
-          isError: true,
-        };
-      }
-
-      // 1. 파일이 열려있는지 확인
-      let isFileOpen = false;
-      try {
-        // 파일이 열려있는지 확인하기 위해 쓰기 모드로 파일 열기 시도
-        const fd = fs.openSync(filePath, "r+");
-        fs.closeSync(fd);
-      } catch (e) {
-        // 파일을 열 수 없다면 이미 다른 프로세스에서 열고 있는 것으로 간주
-        isFileOpen = true;
-      }
-
-      // 2. 파일이 열려있다면, PowerShell로 시트 추가
-      if (isFileOpen) {
-        try {
-          // PowerShell 스크립트 작성
-          const psScript = `
-                    try {
-                        # Excel 애플리케이션 객체 생성 또는 가져오기
-                        try {
-                            $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
-                        } catch {
-                            $excel = New-Object -ComObject Excel.Application
-                        }
-                        
-                        $excel.Visible = $true
-                        $excel.DisplayAlerts = $false
-                        
-                        # 파일 열기 시도
-                        $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
-                        
-                        # 이미 열려있는 워크북 찾기
-                        $workbook = $null
-                        foreach ($wb in $excel.Workbooks) {
-                            if ($wb.FullName -eq $normalizedPath) {
-                                $workbook = $wb
-                                break
-                            }
-                        }
-                        
-                        # 워크북이 없으면 열기
-                        if ($workbook -eq $null) {
-                            $workbook = $excel.Workbooks.Open($normalizedPath)
-                        }
-                        
-                        # 워크북 활성화
-                        $workbook.Activate()
-                        
-                        # 시트 이름 중복 검사
-                        $sheetExists = $false
-                        foreach ($sheet in $workbook.Sheets) {
-                            if ($sheet.Name -eq "${sheetName}") {
-                                $sheetExists = $true
-                                break
-                            }
-                        }
-                        
-                        if ($sheetExists) {
-                            Write-Output "ERROR: 시트 이름 '${sheetName}'이(가) 이미 존재합니다."
-                            return
-                        }
-                        
-                        # 새 시트 추가
-                        $newSheet = $workbook.Worksheets.Add()
-                        $newSheet.Name = "${sheetName}"
-                        
-                        # 시트 활성화
-                        $newSheet.Activate()
-                        
-                        # 데이터 추가 (있는 경우)
-                        ${
-                          data.length > 0
-                            ? `
-                        # 데이터 작성
-                        $rowCount = ${data.length}
-                        $colCount = ${Math.max(
-                          ...data.map((row) => row.length)
-                        )}
-                        
-                        # 데이터를 한 번에 설정할 범위 생성
-                        $targetRange = $newSheet.Range($newSheet.Cells(1, 1), $newSheet.Cells($rowCount, $colCount))
-                        
-                        # 2차원 배열 생성
-                        $dataArray = New-Object 'object[,]' $rowCount, $colCount
-                        
-                        ${data
-                          .map((row, rowIndex) => {
-                            return row
-                              .map((cell, colIndex) => {
-                                // 값 타입에 따른 처리
-                                if (typeof cell === "string") {
-                                  // 문자열은 따옴표로 묶고 특수문자 처리
-                                  const escapedValue = cell
-                                    .replace(/'/g, "''")
-                                    .replace(/"/g, '""');
-                                  return `$dataArray[${rowIndex}, ${colIndex}] = '${escapedValue}'`;
-                                } else if (
-                                  cell === null ||
-                                  cell === undefined
-                                ) {
-                                  // null/undefined는 빈 문자열로
-                                  return `$dataArray[${rowIndex}, ${colIndex}] = ''`;
-                                } else if (typeof cell === "number") {
-                                  // 숫자는 그대로
-                                  return `$dataArray[${rowIndex}, ${colIndex}] = ${cell}`;
-                                } else if (typeof cell === "boolean") {
-                                  // 불리언 값 처리
-                                  return `$dataArray[${rowIndex}, ${colIndex}] = $${cell}`;
-                                } else {
-                                  // 기타 값은 문자열로 변환
-                                  return `$dataArray[${rowIndex}, ${colIndex}] = '${String(
-                                    cell
-                                  ).replace(/'/g, "''")}'`;
-                                }
-                              })
-                              .join("\n");
-                          })
-                          .join("\n")}
-                        
-                        # 데이터 배열을 범위에 한 번에 설정
-                        $targetRange.Value2 = $dataArray
-                        
-                        # 자동 맞춤 적용 (열 너비 자동 조절)
-                        $newSheet.UsedRange.Columns.AutoFit() | Out-Null
-                        `
-                            : ""
-                        }
-                        
-                        # 저장
-                        $workbook.Save()
-                        
-                        Write-Output "SUCCESS: 새 시트 '${sheetName}'이(가) 성공적으로 추가되었습니다."
-                    } catch {
-                        Write-Output "ERROR: $($_.Exception.Message)"
-                    } finally {
-                        if ($excel -ne $null) {
-                            $excel.DisplayAlerts = $true
-                        }
-                    }
-                    `;
-
-          // 임시 PS1 파일 경로
-          const timestamp = Date.now();
-          const scriptPath = path.join(
-            process.cwd(),
-            `add_sheet_${timestamp}.ps1`
-          );
-
-          // 스크립트를 파일로 저장
-          fs.writeFileSync(scriptPath, psScript);
-
-          // PowerShell 스크립트 실행
-          const result = await execPromise(
-            `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-          );
-
-          // 임시 파일 삭제
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch (err) {
-            // 파일 삭제 오류는 무시
-          }
-
-          // 결과 확인
-          if (result && result.includes("SUCCESS")) {
-            // 요청 시 Excel로 파일 열기
-            if (openFile) {
-              await openExcelFile(filePath);
-            }
-
-            return {
-              content: [{ type: "text", text: result.trim() }],
-            };
-          } else {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: result
-                    ? result.trim()
-                    : "시트 추가 중 오류가 발생했습니다.",
-                },
-              ],
-              isError: true,
-            };
-          }
-        } catch (error) {
-          return {
-            content: [
-              { type: "text", text: `시트 추가 오류: ${error.message}` },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // 3. 파일이 열려있지 않은 경우 ExcelJS 사용
-      // ExcelJS 워크북 생성
-      const workbook = new ExcelJS.Workbook();
-
-      try {
-        // 엑셀 파일 읽기
-        await workbook.xlsx.readFile(filePath);
-      } catch (readErr) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 시트 이름 중복 확인
-      if (workbook.getWorksheet(sheetName)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `시트 이름 '${sheetName}'이(가) 이미 존재합니다.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 새 워크시트 추가
-      const worksheet = workbook.addWorksheet(sheetName);
-
-      // 데이터가 있는 경우 추가
-      if (data.length > 0) {
-        worksheet.addRows(data);
-      }
-
-      // 파일 저장
-      await workbook.xlsx.writeFile(filePath);
-
-      // 요청 시 Excel로 파일 열기
-      if (openFile) {
-        await openExcelFile(filePath);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `새 시트 '${sheetName}'이(가) 성공적으로 추가되었습니다.${
-              data.length > 0
-                ? ` ${data.length}행의 데이터가 추가되었습니다.`
-                : ""
-            }`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `시트 추가 오류: ${error.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// 시트 이름 변경 도구
-server.tool(
-  "rename_sheet",
-  "엑셀 파일에서 시트 이름을 변경합니다.",
-  {
-    filePath: z.string().describe("엑셀 파일의 경로"),
-    currentSheetName: z.string().describe("현재 시트 이름"),
-    newSheetName: z.string().describe("변경할 새 시트 이름"),
-    openFile: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
-  },
-  async ({ filePath, currentSheetName, newSheetName, openFile }) => {
-    try {
-      // 파일 존재 확인
-      if (!fs.existsSync(filePath)) {
-        return {
-          content: [
-            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
-          ],
-          isError: true,
-        };
-      }
-
-      // 새 시트 이름 유효성 검사
-      if (newSheetName.length > 31) {
-        return {
-          content: [
-            { type: "text", text: "시트 이름은 31자를 초과할 수 없습니다." },
-          ],
-          isError: true,
-        };
-      }
-
-      // 시트 이름에 유효하지 않은 문자가 있는지 확인
-      const invalidChars = ["/", "\\", "?", "*", "[", "]", ":", "'"];
-      for (const char of invalidChars) {
-        if (newSheetName.includes(char)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `시트 이름에는 다음 문자를 포함할 수 없습니다: ${invalidChars.join(
-                  " "
-                )}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // 1. 파일이 열려있는지 확인
-      let isFileOpen = false;
-      try {
-        // 파일이 열려있는지 확인하기 위해 쓰기 모드로 파일 열기 시도
-        const fd = fs.openSync(filePath, "r+");
-        fs.closeSync(fd);
-      } catch (e) {
-        // 파일을 열 수 없다면 이미 다른 프로세스에서 열고 있는 것으로 간주
-        isFileOpen = true;
-      }
-
-      // 2. 파일이 열려있다면, PowerShell로 시트 이름 변경
-      if (isFileOpen) {
-        try {
-          // PowerShell 스크립트 작성
-          const psScript = `
-          try {
-            # Excel 애플리케이션 객체 생성 또는 가져오기
-            try {
-              $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
-            } catch {
-              $excel = New-Object -ComObject Excel.Application
-            }
-            
-            $excel.Visible = $true
-            $excel.DisplayAlerts = $false
-            
-            # 파일 열기 시도
-            $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
-            
-            # 이미 열려있는 워크북 찾기
-            $workbook = $null
-            foreach ($wb in $excel.Workbooks) {
-              if ($wb.FullName -eq $normalizedPath) {
-                $workbook = $wb
-                break
-              }
-            }
-            
-            # 워크북이 없으면 열기
-            if ($workbook -eq $null) {
-              $workbook = $excel.Workbooks.Open($normalizedPath)
-            }
-            
-            # 워크북 활성화
-            $workbook.Activate()
-            
-            # 시트 찾기
-            $sheetExists = $false
-            $worksheet = $null
-            
-            foreach ($sheet in $workbook.Sheets) {
-              if ($sheet.Name -eq "${currentSheetName}") {
-                $sheetExists = $true
-                $worksheet = $sheet
-                break
-              }
-            }
-            
-            if (-not $sheetExists) {
-              Write-Output "ERROR: 시트 이름 '${currentSheetName}'을(를) 찾을 수 없습니다."
-              return
-            }
-            
-            # 동일한 이름의 시트가 이미 있는지 확인
-            foreach ($sheet in $workbook.Sheets) {
-              if ($sheet.Name -eq "${newSheetName}") {
-                Write-Output "ERROR: 시트 이름 '${newSheetName}'이(가) 이미 존재합니다."
-                return
-              }
-            }
-            
-            # 시트 이름 변경
-            $worksheet.Name = "${newSheetName}"
-            
-            # 저장
-            $workbook.Save()
-            
-            Write-Output "SUCCESS: 시트 이름이 '${currentSheetName}'에서 '${newSheetName}'(으)로 성공적으로 변경되었습니다."
-          } catch {
-            Write-Output "ERROR: $($_.Exception.Message)"
-          } finally {
-            if ($excel -ne $null) {
-              $excel.DisplayAlerts = $true
-            }
-          }
-          `;
-
-          // 임시 PS1 파일 경로
-          const timestamp = Date.now();
-          const scriptPath = path.join(
-            process.cwd(),
-            `rename_sheet_${timestamp}.ps1`
-          );
-
-          // 스크립트를 파일로 저장
-          fs.writeFileSync(scriptPath, psScript);
-
-          // PowerShell 스크립트 실행
-          const result = await execPromise(
-            `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-          );
-
-          // 임시 파일 삭제
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch (err) {
-            // 파일 삭제 오류는 무시
-          }
-
-          // 결과 확인
-          if (result && result.includes("SUCCESS")) {
-            // 요청 시 Excel로 파일 열기
-            if (openFile) {
-              await openExcelFile(filePath);
-            }
-
-            return {
-              content: [{ type: "text", text: result.trim() }],
-            };
-          } else {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: result
-                    ? result.trim()
-                    : "시트 이름 변경 중 오류가 발생했습니다.",
-                },
-              ],
-              isError: true,
-            };
-          }
-        } catch (error) {
-          return {
-            content: [
-              { type: "text", text: `시트 이름 변경 오류: ${error.message}` },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // 3. 파일이 열려있지 않은 경우 ExcelJS 사용
-      // ExcelJS 워크북 생성
-      const workbook = new ExcelJS.Workbook();
-
-      try {
-        // 엑셀 파일 읽기
-        await workbook.xlsx.readFile(filePath);
-      } catch (readErr) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 현재 시트 이름 존재 확인
-      const worksheet = workbook.getWorksheet(currentSheetName);
-      if (!worksheet) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `시트 이름 '${currentSheetName}'을(를) 찾을 수 없습니다.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 새 시트 이름 중복 확인
-      if (workbook.getWorksheet(newSheetName)) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `시트 이름 '${newSheetName}'이(가) 이미 존재합니다.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 시트 이름 변경
-      worksheet.name = newSheetName;
-
-      // 파일 저장
-      await workbook.xlsx.writeFile(filePath);
-
-      // 요청 시 Excel로 파일 열기
-      if (openFile) {
-        await openExcelFile(filePath);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `시트 이름이 '${currentSheetName}'에서 '${newSheetName}'(으)로 성공적으로 변경되었습니다.`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          { type: "text", text: `시트 이름 변경 오류: ${error.message}` },
-        ],
-        isError: true,
-      };
-    }
-  }
-);
-
-// 시트 삭제 도구
-server.tool(
-  "delete_sheet",
-  "엑셀 파일에서 시트를 삭제합니다.",
-  {
-    filePath: z.string().describe("엑셀 파일의 경로"),
-    sheetName: z.string().describe("삭제할 시트 이름"),
-    openFile: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("저장 후 Excel로 열지 여부 (기본값: false)"),
-  },
-  async ({ filePath, sheetName, openFile }) => {
-    try {
-      // 파일 존재 확인
-      if (!fs.existsSync(filePath)) {
-        return {
-          content: [
-            { type: "text", text: `파일을 찾을 수 없습니다: ${filePath}` },
-          ],
-          isError: true,
-        };
-      }
-
-      // 1. 파일이 열려있는지 확인
-      let isFileOpen = false;
-      try {
-        // 파일이 열려있는지 확인하기 위해 쓰기 모드로 파일 열기 시도
-        const fd = fs.openSync(filePath, "r+");
-        fs.closeSync(fd);
-      } catch (e) {
-        // 파일을 열 수 없다면 이미 다른 프로세스에서 열고 있는 것으로 간주
-        isFileOpen = true;
-      }
-
-      // 2. 파일이 열려있다면, PowerShell로 시트 삭제
-      if (isFileOpen) {
-        try {
-          // PowerShell 스크립트 작성
-          const psScript = `
-                    try {
-                        # Excel 애플리케이션 객체 생성 또는 가져오기
-                        try {
-                            $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
-                        } catch {
-                            $excel = New-Object -ComObject Excel.Application
-                        }
-                        
-                        $excel.Visible = $true
-                        $excel.DisplayAlerts = $false
-                        
-                        # 파일 열기 시도
-                        $normalizedPath = "${filePath.replace(/\\/g, "\\\\")}"
-                        
-                        # 이미 열려있는 워크북 찾기
-                        $workbook = $null
-                        foreach ($wb in $excel.Workbooks) {
-                            if ($wb.FullName -eq $normalizedPath) {
-                                $workbook = $wb
-                                break
-                            }
-                        }
-                        
-                        # 워크북이 없으면 열기
-                        if ($workbook -eq $null) {
-                            $workbook = $excel.Workbooks.Open($normalizedPath)
-                        }
-                        
-                        # 워크북 활성화
-                        $workbook.Activate()
-                        
-                        # 시트가 존재하는지 확인
-                        $sheetExists = $false
-                        $worksheet = $null
-                        
-                        foreach ($sheet in $workbook.Sheets) {
-                            if ($sheet.Name -eq "${sheetName}") {
-                                $sheetExists = $true
-                                $worksheet = $sheet
-                                break
-                            }
-                        }
-                        
-                        if (-not $sheetExists) {
-                            Write-Output "ERROR: 시트 이름 '${sheetName}'을(를) 찾을 수 없습니다."
-                            return
-                        }
-                        
-                        # 시트가 마지막 시트인지 확인 (Excel은 항상 최소 1개의 시트가 있어야 함)
-                        if ($workbook.Sheets.Count -eq 1) {
-                            Write-Output "ERROR: 마지막 남은 시트는 삭제할 수 없습니다. Excel 파일에는 최소 하나의 시트가 있어야 합니다."
-                            return
-                        }
-                        
-                        # 시트 삭제
-                        $worksheet.Delete()
-                        
-                        # 저장
-                        $workbook.Save()
-                        
-                        Write-Output "SUCCESS: 시트 '${sheetName}'이(가) 성공적으로 삭제되었습니다."
-                    } catch {
-                        Write-Output "ERROR: $($_.Exception.Message)"
-                    } finally {
-                        if ($excel -ne $null) {
-                            $excel.DisplayAlerts = $true
-                        }
-                    }
-                    `;
-
-          // 임시 PS1 파일 경로
-          const timestamp = Date.now();
-          const scriptPath = path.join(
-            process.cwd(),
-            `delete_sheet_${timestamp}.ps1`
-          );
-
-          // 스크립트를 파일로 저장
-          fs.writeFileSync(scriptPath, psScript);
-
-          // PowerShell 스크립트 실행
-          const result = await execPromise(
-            `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-          );
-
-          // 임시 파일 삭제
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch (err) {
-            // 파일 삭제 오류는 무시
-          }
-
-          // 결과 확인
-          if (result && result.includes("SUCCESS")) {
-            // 요청 시 Excel로 파일 열기
-            if (openFile) {
-              await openExcelFile(filePath);
-            }
-
-            return {
-              content: [{ type: "text", text: result.trim() }],
-            };
-          } else {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: result
-                    ? result.trim()
-                    : "시트 삭제 중 오류가 발생했습니다.",
-                },
-              ],
-              isError: true,
-            };
-          }
-        } catch (error) {
-          return {
-            content: [
-              { type: "text", text: `시트 삭제 오류: ${error.message}` },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // 3. 파일이 열려있지 않은 경우 ExcelJS 사용
-      // ExcelJS 워크북 생성
-      const workbook = new ExcelJS.Workbook();
-
-      try {
-        // 엑셀 파일 읽기
-        await workbook.xlsx.readFile(filePath);
-      } catch (readErr) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `엑셀 파일을 읽을 수 없습니다: ${readErr.message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 시트 존재 확인
-      const worksheet = workbook.getWorksheet(sheetName);
-      if (!worksheet) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `시트 이름 '${sheetName}'을(를) 찾을 수 없습니다.`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 워크북에 시트가 하나만 있는지 확인
-      if (workbook.worksheets.length === 1) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "마지막 남은 시트는 삭제할 수 없습니다. Excel 파일에는 최소 하나의 시트가 있어야 합니다.",
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      // 시트 삭제
-      workbook.removeWorksheet(worksheet.id);
-
-      // 파일 저장
-      await workbook.xlsx.writeFile(filePath);
-
-      // 요청 시 Excel로 파일 열기
-      if (openFile) {
-        await openExcelFile(filePath);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `시트 '${sheetName}'이(가) 성공적으로 삭제되었습니다.`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: "text", text: `시트 삭제 오류: ${error.message}` }],
         isError: true,
       };
     }
